@@ -129,23 +129,10 @@ def auth_register():
         return jsonify(error="password too long"), 400
 
     LOG.d("create user %s", email)
-    user = User.create(email=email, name=dirty_email, password=password, lifetime=True, activated=True)
-    Session.flush()
-
-    # create activation code
-    code = "".join([str(secrets.choice(string.digits)) for _ in range(6)])
-    AccountActivation.create(user_id=user.id, code=code)
-    Session.commit()
-
-    send_email(
-        email,
-        "Just one more step to join SimpleLogin",
-        render("transactional/code-activation.txt.jinja2", user=user, code=code),
-        render("transactional/code-activation.html", user=user, code=code),
-    )
+    user = User.create(email=email, name=dirty_email, password=password, lifetime=True, activated=True, commit=True)
 
     RegisterEvent(RegisterEvent.ActionType.success, RegisterEvent.Source.api).send()
-    return jsonify(msg="User needs to confirm their account"), 200
+    return jsonify(msg="Account is created"), 200
 
 
 @api_bp.route("/auth/activate", methods=["POST"])
