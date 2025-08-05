@@ -129,7 +129,8 @@ def auth_register():
         return jsonify(error="password too long"), 400
 
     LOG.d("create user %s", email)
-    user = User.create(email=email, name=dirty_email, password=password, lifetime=True, activated=True, commit=True)
+    user = User.create(email=email, name=dirty_email, password=password, lifetime=True, activated=True)
+    Session.commit()
 
     RegisterEvent(RegisterEvent.ActionType.success, RegisterEvent.Source.api).send()
     return jsonify(msg="Account is created"), 200
