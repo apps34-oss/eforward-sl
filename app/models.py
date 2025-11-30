@@ -242,6 +242,8 @@ class AuditLogActionEnum(EnumE):
     stop_trial = 11
     unlink_user = 12
     delete_custom_domain = 13
+    clear_delete_on = 14
+    update_subdomain_quota = 15
 
 
 class Phase(EnumE):
@@ -1751,7 +1753,7 @@ class Alias(Base, ModelMixin):
 
         new_alias = cls(**kw)
         user = User.get(new_alias.user_id)
-        if user.is_premium():
+        if user.is_premium() and not user.in_trial():
             limits = config.ALIAS_CREATE_RATE_LIMIT_PAID
         else:
             limits = config.ALIAS_CREATE_RATE_LIMIT_FREE
@@ -2447,6 +2449,9 @@ class DeletedAlias(Base, ModelMixin):
         default=AliasDeleteReason.Unspecified,
         server_default=str(AliasDeleteReason.Unspecified.value),
     )
+    alias_id = sa.Column(
+        sa.Integer, nullable=True, server_default=None, default=None, index=True
+    )
 
     @classmethod
     def create(cls, **kw):
@@ -2688,6 +2693,13 @@ class AutoCreateRule(Base, ModelMixin):
     # the order in which rules are evaluated in case there are multiple rules
     order = sa.Column(sa.Integer, default=0, nullable=False)
 
+    # optional display name applied to aliases created by this rule
+    display_name = sa.Column(
+        sa.String(128),
+        nullable=True,
+        server_default=None,
+    )
+
     custom_domain = orm.relationship(CustomDomain, backref="_auto_create_rules")
 
     mailboxes = orm.relationship(
@@ -2721,6 +2733,7 @@ class DomainDeletedAlias(Base, ModelMixin):
     __table_args__ = (
         sa.UniqueConstraint("domain_id", "email", name="uq_domain_trash"),
         sa.Index("ix_domain_deleted_alias_user_id", "user_id"),
+        sa.Index("ix_domain_deleted_alias_alias_id", "alias_id"),
     )
 
     email = sa.Column(sa.String(256), nullable=False)
@@ -2736,6 +2749,13 @@ class DomainDeletedAlias(Base, ModelMixin):
         nullable=False,
         default=AliasDeleteReason.Unspecified,
         server_default=str(AliasDeleteReason.Unspecified.value),
+    )
+
+    alias_id = sa.Column(
+        sa.Integer,
+        nullable=True,
+        server_default=None,
+        default=None,
     )
 
     @classmethod
@@ -2969,10 +2989,17 @@ class Mailbox(Base, ModelMixin):
                 alias.mailbox_id = first_mb.id
                 alias._mailboxes.remove(first_mb)
             else:
-                from app.alias_delete import perform_alias_deletion
+                from app.alias_delete import perform_alias_deletion, move_alias_to_trash
+                # If the user setting is DeleteImmediately, perform alias deletion
+                # Otherwise, if the user setting is MoveToTrash, assign the default mailbox and move them to trash
 
-                # only put aliases that have mailbox as a single mailbox into trash
-                perform_alias_deletion(alias, user, AliasDeleteReason.MailboxDeleted)
+                if user.alias_delete_action == UserAliasDeleteAction.DeleteImmediately:
+                    perform_alias_deletion(
+                        alias, user, AliasDeleteReason.MailboxDeleted
+                    )
+                else:
+                    alias.mailbox_id = user.default_mailbox_id
+                    move_alias_to_trash(alias, user, AliasDeleteReason.MailboxDeleted)
             Session.commit()
 
         cls.filter(cls.id == obj_id).delete()
@@ -3796,6 +3823,28 @@ class AdminAuditLog(Base):
             model="User",
             model_id=user_id,
             data={},
+        )
+
+    @classmethod
+    def clear_delete_on(cls, admin_user_id: int, user_id: int):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.clear_delete_on.value,
+            model="User",
+            model_id=user_id,
+            data={},
+        )
+
+    @classmethod
+    def update_subdomain_quota(
+        cls, admin_user_id: int, user_id: int, old_quota: int, new_quota: int
+    ):
+        cls.create(
+            admin_user_id=admin_user_id,
+            action=AuditLogActionEnum.update_subdomain_quota.value,
+            model="User",
+            model_id=user_id,
+            data={"old_quota": old_quota, "new_quota": new_quota},
         )
 
 

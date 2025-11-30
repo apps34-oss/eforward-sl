@@ -33,7 +33,6 @@ It should contain the following info:
 
 import argparse
 import email
-import time
 import uuid
 from email import encoders
 from email.encoders import encode_noop
@@ -47,6 +46,7 @@ from typing import List, Tuple, Optional
 
 import newrelic.agent
 import sentry_sdk
+import time
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import Envelope
 from email_validator import validate_email, EmailNotValidError
@@ -743,11 +743,11 @@ def forward_email_to_mailbox(
     mailbox,
     user,
     reply_to_contacts: list[Contact],
-) -> (bool, str):
-    LOG.d("Forward %s -> %s -> %s", contact, alias, mailbox)
+) -> Tuple[bool, str]:
+    LOG.debug(f"Forward {contact} -> {alias} -> {mailbox} ({mailbox.user})")
 
     if mailbox.disabled:
-        LOG.d("%s disabled, do not forward")
+        LOG.d(f"{mailbox} disabled, do not forward")
         if should_ignore_bounce(envelope.mail_from):
             return True, status.E207
         else:
@@ -1059,6 +1059,11 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
         return False, status.E502
 
     alias = contact.alias
+
+    if alias.is_trashed():
+        LOG.d("%s is trashed, do not forward", alias)
+        return False, status.E502
+
     alias_address: str = contact.alias.email
     alias_domain = get_email_domain_part(alias_address)
 
@@ -1872,9 +1877,8 @@ def handle_transactional_bounce(
 ):
     LOG.d("handle transactional bounce sent to %s", rcpt_to)
     if transactional_id is None:
-        LOG.i(
-            f"No transactional record for {envelope.mail_from} -> {envelope.rcpt_tos}"
-        )
+        LOG.i(f"No transactional id for {envelope.mail_from} -> {envelope.rcpt_tos}")
+        save_envelope_for_debugging(envelope, "no-txid")
         return
 
     transactional = TransactionalEmail.get(transactional_id)
@@ -1883,7 +1887,9 @@ def handle_transactional_bounce(
         LOG.i(
             f"No transactional record for {envelope.mail_from} -> {envelope.rcpt_tos}"
         )
+        save_envelope_for_debugging(envelope, "no-tx")
         return
+
     LOG.i("Create bounce for %s", transactional.email)
     bounce_info = get_mailbox_bounce_info(msg)
     if bounce_info:

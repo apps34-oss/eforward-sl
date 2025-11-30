@@ -1,5 +1,4 @@
 import os
-import time
 from datetime import timedelta
 
 import arrow
@@ -8,6 +7,7 @@ import flask_limiter
 import flask_profiler
 import newrelic.agent
 import sentry_sdk
+import time
 from flask import (
     Flask,
     redirect,
@@ -46,6 +46,8 @@ from app.admin_model import (
     CustomDomainSearchAdmin,
     AbuserLookupAdmin,
     ForbiddenMxIpAdmin,
+    MailboxSearchAdmin,
+    EmailDomainSearchAdmin,
 )
 from app.api.base import api_bp
 from app.auth.base import auth_bp
@@ -457,8 +459,16 @@ def init_admin(app):
     admin.init_app(app, index_view=SLAdminIndexView())
     admin.add_view(EmailSearchAdmin(name="Email Search", endpoint="admin.email_search"))
     admin.add_view(
+        MailboxSearchAdmin(name="Mailbox search", endpoint="admin.mailbox_search")
+    )
+    admin.add_view(
         CustomDomainSearchAdmin(
             name="Custom domain search", endpoint="admin.custom_domain_search"
+        )
+    )
+    admin.add_view(
+        EmailDomainSearchAdmin(
+            name="Email domain search", endpoint="admin.email_domain_search"
         )
     )
     admin.add_view(
@@ -512,7 +522,9 @@ def register_custom_commands(app):
     @app.cli.command("dummy-data")
     def dummy_data():
         from init_app import add_sl_domains, add_proton_partner
+        from app.rate_limiter import set_rate_limit_enabled
 
+        set_rate_limit_enabled(False)
         LOG.w("reset db, add fake data")
         add_proton_partner()
         fake_data()

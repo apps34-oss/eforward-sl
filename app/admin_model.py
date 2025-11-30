@@ -15,6 +15,7 @@ from flask_admin.form import SecureForm
 from flask_admin.model.template import EndpointLinkRowAction
 from flask_login import current_user
 from markupsafe import Markup
+from sqlalchemy import or_, and_
 
 from app import models, s3, config
 from app.abuser import mark_user_as_abuser, unmark_as_abusive_user
@@ -29,6 +30,7 @@ from app.custom_domain_validation import (
 )
 from app.db import Session
 from app.dns_utils import get_network_dns_client
+from app.errors import ProtonPartnerNotSetUp
 from app.events.event_dispatcher import EventDispatcher
 from app.events.generated.event_pb2 import EventContent, UserPlanChanged
 from app.models import (
@@ -55,6 +57,7 @@ from app.models import (
     CustomDomain,
 )
 from app.newsletter_utils import send_newsletter_to_user, send_newsletter_to_address
+from app.proton.proton_partner import get_proton_partner
 from app.proton.proton_unlink import perform_proton_account_unlink
 from app.user_audit_log_utils import emit_user_audit_log, UserAuditLogAction
 from app.utils import sanitize_email
@@ -848,6 +851,26 @@ class EmailSearchResult:
         if user_audit_log:
             output.user_audit_log = user_audit_log
             output.no_match = False
+
+        # Search by PartnerUser.external_user_id for Proton partner
+        if not output.user:  # Only search if we haven't found a user yet
+            try:
+                proton_partner = get_proton_partner()
+                partner_user = PartnerUser.filter_by(
+                    partner_id=proton_partner.id, external_user_id=email
+                ).first()
+                if partner_user:
+                    output.user = partner_user.user
+                    output.user_audit_log = (
+                        UserAuditLog.filter_by(user_id=partner_user.user.id)
+                        .order_by(UserAuditLog.created_at.desc())
+                        .all()
+                    )
+                    output.no_match = False
+            except ProtonPartnerNotSetUp:
+                # Proton partner not configured, skip this search
+                pass
+
         mailboxes = (
             Mailbox.filter_by(email=email).order_by(Mailbox.id.desc()).limit(10).all()
         )
@@ -978,6 +1001,74 @@ class EmailSearchAdmin(BaseView):
         Session.commit()
 
         return redirect(url_for("admin.email_search.index", query=user_id))
+
+    @expose("/stop_user_deletion", methods=["POST"])
+    def stop_user_deletion(self):
+        user_id = request.form.get("user_id")
+        if not user_id:
+            flash("Missing user_id", "error")
+            return redirect(url_for("admin.email_search.index"))
+        try:
+            user_id = int(user_id)
+        except ValueError:
+            flash("Invalid user_id", "error")
+            return redirect(url_for("admin.email_search.index"))
+        user = User.get(user_id)
+        if user is None:
+            flash("User not found", "error")
+            return redirect(url_for("admin.email_search.index", query=user_id))
+
+        if user.delete_on is None:
+            flash("User is not scheduled for deletion", "warning")
+            return redirect(url_for("admin.email_search.index", query=user.email))
+
+        user.delete_on = None
+        AdminAuditLog.clear_delete_on(current_user.id, user.id)
+        Session.commit()
+
+        flash(f"Cancelled scheduled deletion for user {user.email}", "success")
+        return redirect(url_for("admin.email_search.index", query=user.email))
+
+    @expose("/update_subdomain_quota", methods=["POST"])
+    def update_subdomain_quota(self):
+        user_id = request.form.get("user_id")
+        new_quota = request.form.get("subdomain_quota")
+
+        if not user_id:
+            flash("Missing user_id", "error")
+            return redirect(url_for("admin.email_search.index"))
+        if not new_quota:
+            flash("Missing subdomain quota value", "error")
+            return redirect(url_for("admin.email_search.index"))
+
+        try:
+            user_id = int(user_id)
+            new_quota = int(new_quota)
+        except ValueError:
+            flash("Invalid user_id or quota value", "error")
+            return redirect(url_for("admin.email_search.index"))
+
+        if new_quota < 0:
+            flash("Subdomain quota cannot be negative", "error")
+            return redirect(url_for("admin.email_search.index"))
+
+        user = User.get(user_id)
+        if user is None:
+            flash("User not found", "error")
+            return redirect(url_for("admin.email_search.index", query=user_id))
+
+        old_quota = user._subdomain_quota
+        user._subdomain_quota = new_quota
+        AdminAuditLog.update_subdomain_quota(
+            current_user.id, user.id, old_quota, new_quota
+        )
+        Session.commit()
+
+        flash(
+            f"Updated subdomain quota for user {user.email} from {old_quota} to {new_quota}",
+            "success",
+        )
+        return redirect(url_for("admin.email_search.index", query=user.email))
 
 
 class CustomDomainWithValidationData:
@@ -1223,4 +1314,145 @@ class AbuserLookupAdmin(BaseView):
             "admin/abuser_lookup.html",
             data=result,
             query=query,
+        )
+
+
+class MailboxSearchAdmin(BaseView):
+    def is_accessible(self):
+        return current_user.is_authenticated and current_user.is_admin
+
+    def inaccessible_callback(self, name, **kwargs):
+        # redirect to login page if user doesn't have access
+        flash("You don't have access to the admin page", "error")
+        return redirect(url_for("dashboard.index", next=request.url))
+
+    @expose("/", methods=["GET", "POST"])
+    def index(self):
+        query = request.args.get("query")
+        if query is None:
+            search = MailboxSearchResult()
+        else:
+            try:
+                mailbox_id = int(query)
+                mailbox = Mailbox.get_by(id=mailbox_id)
+            except ValueError:
+                mailbox = Mailbox.get_by(email=query)
+            search = MailboxSearchResult.from_mailbox(mailbox)
+
+        return self.render(
+            "admin/mailbox_search.html",
+            data=search,
+            query=query,
+            helper=EmailSearchHelpers,
+        )
+
+
+class MailboxSearchResult:
+    def __init__(self):
+        self.no_match: bool = False
+        self.mailbox: Optional[Mailbox] = None
+        self.aliases: List[Alias] = []
+
+    @staticmethod
+    def from_mailbox(mbox: Optional[Mailbox]) -> MailboxSearchResult:
+        out = MailboxSearchResult()
+        if mbox is None:
+            out.no_match = True
+            return out
+        out.mailbox = mbox
+        out.aliases = mbox.aliases[:10]
+        out.aliases = (
+            Session.query(Alias)
+            .join(
+                AliasMailbox,
+                and_(
+                    AliasMailbox.alias_id == Alias.id,
+                    AliasMailbox.mailbox_id == mbox.id,
+                ),
+                isouter=True,
+            )
+            .filter(
+                or_(Alias.mailbox_id == mbox.id, AliasMailbox.mailbox_id == mbox.id)
+            )
+            .order_by(Alias.id)
+            .limit(10)
+            .all()
+        )
+
+        return out
+
+
+class EmailDomainSearchResult:
+    def __init__(self):
+        self.no_match: bool = False
+        self.users: List[User] = []
+
+    @staticmethod
+    def from_mailboxes(users: List[User]) -> EmailDomainSearchResult:
+        out = EmailDomainSearchResult()
+        if not users:
+            out.no_match = True
+            return out
+        out.users = users
+        return out
+
+
+class EmailDomainSearchAdmin(BaseView):
+    def is_accessible(self):
+        return current_user.is_authenticated and current_user.is_admin
+
+    def inaccessible_callback(self, name, **kwargs):
+        # redirect to login page if user doesn't have access
+        flash("You don't have access to the admin page", "error")
+        return redirect(url_for("dashboard.index", next=request.url))
+
+    @expose("/disable_user", methods=["POST"])
+    def disable_user(self):
+        query = request.form.get("query")
+        user_id = request.form.get("user_id")
+        if not user_id:
+            return redirect(url_for("admin.email_domain_search.index", query=query))
+        user = User.get(int(user_id))
+        if not user:
+            flash(
+                f"Cannot find user with {user_id}",
+                "warning",
+            )
+            return redirect(url_for("admin.email_domain_search.index", query=query))
+        mark_user_as_abuser(
+            user,
+            f"Marked as abuser from the email domain search in the admin panel while searching for '{query}'",
+        )
+        flash(
+            f"Marked user {user.email} ({user.id}) as abuser",
+            "warning",
+        )
+        return redirect(url_for("admin.email_domain_search.index", query=query))
+
+    @expose("/", methods=["GET", "POST"])
+    def index(self):
+        query = request.args.get("query")
+        if not query:
+            search = EmailDomainSearchResult()
+        else:
+            users = (
+                User.query()
+                .join(Mailbox, User.id == Mailbox.user_id, isouter=True)
+                .filter(
+                    User.disabled.isnot(True),
+                    or_(
+                        User.email.like(f"%@{query}"), Mailbox.email.like(f"%@{query}")
+                    ),
+                )
+                .order_by(User.id.asc())
+                .limit(50)
+                .all()
+            )
+            search = EmailDomainSearchResult.from_mailboxes(users)
+
+        return self.render(
+            "admin/mailbox_domain_search.html",
+            data=search,
+            query=query,
+            helper=EmailSearchHelpers,
         )
